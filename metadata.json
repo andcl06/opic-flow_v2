@@ -1,0 +1,7 @@
+{
+  "name": "OPIc Flow_v2",
+  "description": "AI-powered OPIc study assistant with Gemini and Google Sheets integration.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
