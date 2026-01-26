@@ -2,6 +2,59 @@
 import { MASTER_SPREADSHEET_ID, MASTER_SHEET_NAME, SURVEY_DB_SHEET_NAME, QUESTION_DB_SHEET_NAME, CONFIG_SETTINGS_SHEET_NAME } from '../constants';
 import { GoogleUser, UserStudyContext, SurveyData, UnitProgress, StudyLogEntry, VocabularyEntry } from '../types';
 
+// --- Token Refresh Interceptor ---
+let isRefreshing = false;
+let refreshSubscribers: ((token: string) => void)[] = [];
+
+function subscribeTokenRefresh(cb: (token: string) => void) {
+  refreshSubscribers.push(cb);
+}
+
+function onTokenRefreshed(token: string) {
+  refreshSubscribers.forEach((cb) => cb(token));
+  refreshSubscribers = [];
+}
+
+const authenticatedFetch = async (url: string, options: RequestInit = {}, token: string): Promise<Response> => {
+  const executeRequest = (t: string) => {
+    const headers = new Headers(options.headers || {});
+    headers.set('Authorization', `Bearer ${t}`);
+    return fetch(url, { ...options, headers });
+  };
+
+  const response = await executeRequest(token);
+
+  // 토큰 만료(401) 발생 시
+  if (response.status === 401) {
+    if (!isRefreshing) {
+      isRefreshing = true;
+      // App.tsx에 토큰 갱신 요청 이벤트 발송
+      window.dispatchEvent(new CustomEvent('NEED_TOKEN_REFRESH'));
+      
+      // 토큰 갱신 완료 이벤트 리스너 (한 번만 등록)
+      const handleRefreshed = (e: any) => {
+        const newToken = e.detail?.token;
+        if (newToken) {
+          onTokenRefreshed(newToken);
+        }
+        isRefreshing = false;
+        window.removeEventListener('TOKEN_REFRESHED_SUCCESS', handleRefreshed);
+      };
+      window.addEventListener('TOKEN_REFRESHED_SUCCESS', handleRefreshed);
+    }
+
+    // 새 토큰이 올 때까지 대기 후 재시도
+    return new Promise((resolve) => {
+      subscribeTokenRefresh((newToken: string) => {
+        resolve(executeRequest(newToken));
+      });
+    });
+  }
+
+  return response;
+};
+// ---------------------------------
+
 const extractId = (input: string | undefined): string | null => {
   if (!input || typeof input !== 'string') return null;
   const val = input.trim();
@@ -35,9 +88,7 @@ const buildRowFromMap = (headerMap: Record<string, number>, data: Record<string,
 export const fetchConfigSettings = async (accessToken: string): Promise<Record<string, string>> => {
   try {
     const range = `${CONFIG_SETTINGS_SHEET_NAME}!A2:B10`; 
-    const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${MASTER_SPREADSHEET_ID}/values/${encodeURIComponent(range)}`, {
-      headers: { Authorization: `Bearer ${accessToken}` }
-    });
+    const res = await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${MASTER_SPREADSHEET_ID}/values/${encodeURIComponent(range)}`, {}, accessToken);
     if (!res.ok) throw new Error("Config fetch failed");
     const data = await res.json();
     const rows = data.values || [];
@@ -56,9 +107,7 @@ export const fetchConfigSettings = async (accessToken: string): Promise<Record<s
 
 export const fetchSurveyDatabase = async (accessToken: string) => {
   const range = `${SURVEY_DB_SHEET_NAME}!A1:H200`; 
-  const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${MASTER_SPREADSHEET_ID}/values/${encodeURIComponent(range)}`, {
-    headers: { Authorization: `Bearer ${accessToken}` }
-  });
+  const res = await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${MASTER_SPREADSHEET_ID}/values/${encodeURIComponent(range)}`, {}, accessToken);
   if (!res.ok) throw new Error("Survey DB fetch failed");
   const data = await res.json();
   const rows = data.values || [];
@@ -79,9 +128,7 @@ export const fetchSurveyDatabase = async (accessToken: string) => {
 
 export const fetchQuestionDatabase = async (accessToken: string) => {
   const range = `${QUESTION_DB_SHEET_NAME}!A1:K1000`; 
-  const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${MASTER_SPREADSHEET_ID}/values/${encodeURIComponent(range)}`, {
-    headers: { Authorization: `Bearer ${accessToken}` }
-  });
+  const res = await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${MASTER_SPREADSHEET_ID}/values/${encodeURIComponent(range)}`, {}, accessToken);
   if (!res.ok) throw new Error("Question DB fetch failed");
   const data = await res.json();
   const rows = data.values || [];
@@ -113,13 +160,15 @@ export const fetchQuestionDatabase = async (accessToken: string) => {
 export const syncUserWithMasterSheet = async (user: GoogleUser, accessToken: string, onlyCheck: boolean = false): Promise<UserStudyContext> => {
   try {
     const range = `${MASTER_SHEET_NAME}!A1:Z1000`; 
-    const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${MASTER_SPREADSHEET_ID}/values/${encodeURIComponent(range)}`, {
-      headers: { Authorization: `Bearer ${accessToken}` }
-    });
+    const res = await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${MASTER_SPREADSHEET_ID}/values/${encodeURIComponent(range)}`, {}, accessToken);
+    
+    // 응답 자체가 실패한 경우 (네트워크 등)
     if (!res.ok) throw new Error(`Master fetch failed: ${res.status}`);
     
     const data = await res.json();
     const rows: string[][] = data.values || [];
+    
+    // 데이터가 아예 없는 경우에만 NEW 반환
     if (rows.length === 0) return { status: 'NEW' };
     
     const h = getHeaderMap(rows[0]);
@@ -139,7 +188,9 @@ export const syncUserWithMasterSheet = async (user: GoogleUser, accessToken: str
       }
       return { status: 'PROVISIONING' };
     } else {
+      // 명확하게 유저가 리스트에 없는 경우
       if (onlyCheck) return { status: 'NEW' };
+      
       const rowData = { 
         "user email": user.email, 
         "user name": user.name, 
@@ -151,14 +202,11 @@ export const syncUserWithMasterSheet = async (user: GoogleUser, accessToken: str
       };
       const newRow = buildRowFromMap(h, rowData);
       
-      const appendRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${MASTER_SPREADSHEET_ID}/values/${encodeURIComponent(MASTER_SHEET_NAME)}!A2:append?valueInputOption=USER_ENTERED`, {
+      const appendRes = await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${MASTER_SPREADSHEET_ID}/values/${encodeURIComponent(MASTER_SHEET_NAME)}!A2:append?valueInputOption=USER_ENTERED`, {
         method: 'POST',
-        headers: { 
-          'Authorization': `Bearer ${accessToken}`, 
-          'Content-Type': 'application/json'
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ values: [newRow] })
-      });
+      }, accessToken);
       
       if (!appendRes.ok) throw new Error("Master registration failed");
       
@@ -166,16 +214,15 @@ export const syncUserWithMasterSheet = async (user: GoogleUser, accessToken: str
     }
   } catch (error) { 
     console.error("syncUserWithMasterSheet error:", error);
-    return { status: 'NEW' }; 
+    // 단순 API 실패 시 신규 유저로 간주하지 않고 에러를 던지거나 보수적으로 처리
+    throw error;
   }
 };
 
 export const checkSheetStatus = async (email: string, accessToken: string): Promise<UserStudyContext> => {
   try {
     const range = `${MASTER_SHEET_NAME}!A1:Z1000`;
-    const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${MASTER_SPREADSHEET_ID}/values/${encodeURIComponent(range)}`, {
-      headers: { Authorization: `Bearer ${accessToken}` }
-    });
+    const res = await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${MASTER_SPREADSHEET_ID}/values/${encodeURIComponent(range)}`, {}, accessToken);
     const data = await res.json();
     const rows: string[][] = data.values || [];
     if (rows.length < 2) return { status: 'PROVISIONING' }; 
@@ -195,9 +242,7 @@ export const checkSheetStatus = async (email: string, accessToken: string): Prom
 export const fetchAllUsersProgress = async (accessToken: string): Promise<any[]> => {
   try {
     const range = `${MASTER_SHEET_NAME}!A1:Z1000`;
-    const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${MASTER_SPREADSHEET_ID}/values/${encodeURIComponent(range)}`, {
-      headers: { Authorization: `Bearer ${accessToken}` }
-    });
+    const res = await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${MASTER_SPREADSHEET_ID}/values/${encodeURIComponent(range)}`, {}, accessToken);
     if (!res.ok) throw new Error("Failed to fetch all users progress");
     const data = await res.json();
     const rows = data.values || [];
@@ -222,11 +267,10 @@ export const uploadAudioToDrive = async (audioBlob: Blob, fileName: string, fold
   const form = new FormData();
   form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
   form.append('file', audioBlob);
-  const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink', {
+  const res = await authenticatedFetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink', {
     method: 'POST',
-    headers: { Authorization: `Bearer ${accessToken}` },
     body: form
-  });
+  }, accessToken);
   if (!res.ok) return null;
   const data = await res.json();
   return data.webViewLink || `https://drive.google.com/file/d/${data.id}/view`;
@@ -235,52 +279,47 @@ export const uploadAudioToDrive = async (audioBlob: Blob, fileName: string, fold
 export const deleteFileFromDrive = async (fileUrl: string, accessToken: string): Promise<boolean> => {
   const fileId = extractId(fileUrl);
   if (!fileId) return false;
-  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}`, {
-    method: 'DELETE',
-    headers: { Authorization: `Bearer ${accessToken}` }
-  });
+  const res = await authenticatedFetch(`https://www.googleapis.com/drive/v3/files/${fileId}`, {
+    method: 'DELETE'
+  }, accessToken);
   return res.status === 204;
 };
 
 export const saveStudyLog = async (sheetId: string, log: StudyLogEntry, accessToken: string): Promise<boolean> => {
-  const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Study_Log!A:A:append?valueInputOption=USER_ENTERED`, {
+  const res = await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Study_Log!A:A:append?valueInputOption=USER_ENTERED`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ values: [[
       log.sessionId, log.date, log.unit, log.type, log.question, log.keywords, 
       log.rawAnswer, log.rawAudioLink, log.grade, log.correction, log.translatedAnswer, log.feedback, log.audioLink
     ]] })
-  });
+  }, accessToken);
   return res.ok;
 };
 
 export const updateStudyLog = async (sheetId: string, log: StudyLogEntry, accessToken: string): Promise<boolean> => {
   try {
-    const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Study_Log!A:A`, {
-      headers: { Authorization: `Bearer ${accessToken}` }
-    });
+    const res = await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Study_Log!A:A`, {}, accessToken);
     const data = await res.json();
     const rows = data.values || [];
     const rowIndex = rows.findIndex((r: any[]) => r[0] === log.sessionId);
     if (rowIndex === -1) return false;
     const sheetRow = rowIndex + 1;
-    await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Study_Log!B${sheetRow}:M${sheetRow}?valueInputOption=USER_ENTERED`, {
+    await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Study_Log!B${sheetRow}:M${sheetRow}?valueInputOption=USER_ENTERED`, {
       method: 'PUT',
-      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ values: [[
         log.date, log.unit, log.type, log.question, log.keywords, 
         log.rawAnswer, log.rawAudioLink, log.grade, log.correction, log.translatedAnswer, log.feedback, log.audioLink
       ]] })
-    });
+    }, accessToken);
     return true;
   } catch (e) { return false; }
 };
 
 export const fetchStudyLogs = async (sheetId: string, accessToken: string): Promise<StudyLogEntry[]> => {
   try {
-    const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Study_Log!A2:M1000`, { 
-      headers: { Authorization: `Bearer ${accessToken}` } 
-    });
+    const res = await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Study_Log!A2:M1000`, {}, accessToken);
     const data = await res.json();
     return (data.values || []).map((row: any[]) => ({
       sessionId: row[0] || "", date: row[1] || "", unit: row[2] || "", type: row[3] || "", 
@@ -293,47 +332,41 @@ export const fetchStudyLogs = async (sheetId: string, accessToken: string): Prom
 
 export const deleteStudyLogBySessionId = async (sheetId: string, sessionId: string, accessToken: string): Promise<boolean> => {
   try {
-    const valRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Study_Log!A1:A1000`, {
-      headers: { Authorization: `Bearer ${accessToken}` }
-    });
+    const valRes = await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Study_Log!A1:A1000`, {}, accessToken);
     const valData = await valRes.json();
     const rows = valData.values || [];
     const rowIndex = rows.findIndex((r: any[]) => r[0] === sessionId);
     if (rowIndex === -1) return false;
-    const metaRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}?fields=sheets.properties`, {
-      headers: { Authorization: `Bearer ${accessToken}` }
-    });
+    const metaRes = await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}?fields=sheets.properties`, {}, accessToken);
     const metaData = await metaRes.json();
     const tabId = metaData.sheets.find((s: any) => s.properties.title === "Study_Log")?.properties.sheetId;
-    const deleteRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
+    const deleteRes = await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         requests: [{
           deleteDimension: { range: { sheetId: tabId, dimension: "ROWS", startIndex: rowIndex, endIndex: rowIndex + 1 } }
         }]
       })
-    });
+    }, accessToken);
     return deleteRes.ok;
   } catch (e) { return false; }
 };
 
 export const saveVocabularyEntry = async (sheetId: string, entry: VocabularyEntry, accessToken: string): Promise<boolean> => {
-  const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Vocabulary_Bank!A:A:append?valueInputOption=USER_ENTERED`, {
+  const res = await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Vocabulary_Bank!A:A:append?valueInputOption=USER_ENTERED`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ values: [[
       entry.id, entry.expression, entry.meaning, entry.usageExample, entry.unitSource, entry.addedDate, entry.status
     ]] })
-  });
+  }, accessToken);
   return res.ok;
 };
 
 export const fetchVocabularyBank = async (sheetId: string, accessToken: string): Promise<VocabularyEntry[]> => {
   try {
-    const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Vocabulary_Bank!A2:G1000`, { 
-      headers: { Authorization: `Bearer ${accessToken}` } 
-    });
+    const res = await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Vocabulary_Bank!A2:G1000`, {}, accessToken);
     const data = await res.json();
     return (data.values || []).map((row: any[]) => ({
       id: row[0] || "",
@@ -349,27 +382,23 @@ export const fetchVocabularyBank = async (sheetId: string, accessToken: string):
 
 export const deleteVocabularyEntry = async (sheetId: string, vocabId: string, accessToken: string): Promise<boolean> => {
   try {
-    const valRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Vocabulary_Bank!A1:A1000`, {
-      headers: { Authorization: `Bearer ${accessToken}` }
-    });
+    const valRes = await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Vocabulary_Bank!A1:A1000`, {}, accessToken);
     const valData = await valRes.json();
     const rows = valData.values || [];
     const rowIndex = rows.findIndex((r: any[]) => r[0] === vocabId);
     if (rowIndex === -1) return false;
-    const metaRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}?fields=sheets.properties`, {
-      headers: { Authorization: `Bearer ${accessToken}` }
-    });
+    const metaRes = await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}?fields=sheets.properties`, {}, accessToken);
     const metaData = await metaRes.json();
     const tabId = metaData.sheets.find((s: any) => s.properties.title === "Vocabulary_Bank")?.properties.sheetId;
-    const deleteRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
+    const deleteRes = await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         requests: [{
           deleteDimension: { range: { sheetId: tabId, dimension: "ROWS", startIndex: rowIndex, endIndex: rowIndex + 1 } }
         }]
       })
-    });
+    }, accessToken);
     return deleteRes.ok;
   } catch (e) { return false; }
 };
@@ -383,11 +412,11 @@ export const updateUnitStatus = async (
   lastPractice: string = "-"
 ): Promise<void> => {
   const rowIdx = unitIndex + 2;
-  await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Progress!E${rowIdx}:G${rowIdx}?valueInputOption=USER_ENTERED`, {
+  await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Progress!E${rowIdx}:G${rowIdx}?valueInputOption=USER_ENTERED`, {
     method: 'PUT',
-    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ values: [[status, grade, lastPractice]] }) 
-  });
+  }, accessToken);
 };
 
 export const updateMasterProgress = async (
@@ -404,9 +433,7 @@ export const updateMasterProgress = async (
     const lastAccess = new Date().toLocaleDateString();
 
     const range = `${MASTER_SHEET_NAME}!A1:Z1000`;
-    const masterRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${MASTER_SPREADSHEET_ID}/values/${encodeURIComponent(range)}`, {
-      headers: { Authorization: `Bearer ${accessToken}` }
-    });
+    const masterRes = await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${MASTER_SPREADSHEET_ID}/values/${encodeURIComponent(range)}`, {}, accessToken);
     const masterData = await masterRes.json();
     const rows = masterData.values || [];
     if (rows.length < 2) return;
@@ -424,17 +451,17 @@ export const updateMasterProgress = async (
     const colProgress = String.fromCharCode(65 + progressIdx);
     const colLastAccess = String.fromCharCode(65 + lastAccessIdx);
 
-    await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${MASTER_SPREADSHEET_ID}/values/${MASTER_SHEET_NAME}!${colProgress}${sheetRow}?valueInputOption=USER_ENTERED`, {
+    await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${MASTER_SPREADSHEET_ID}/values/${MASTER_SHEET_NAME}!${colProgress}${sheetRow}?valueInputOption=USER_ENTERED`, {
       method: 'PUT',
-      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ values: [[progressPercent]] })
-    });
+    }, accessToken);
 
-    await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${MASTER_SPREADSHEET_ID}/values/${MASTER_SHEET_NAME}!${colLastAccess}${sheetRow}?valueInputOption=USER_ENTERED`, {
+    await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${MASTER_SPREADSHEET_ID}/values/${MASTER_SHEET_NAME}!${colLastAccess}${sheetRow}?valueInputOption=USER_ENTERED`, {
       method: 'PUT',
-      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ values: [[lastAccess]] })
-    });
+    }, accessToken);
 
   } catch (error) {
     console.error("updateMasterProgress error:", error);
@@ -442,7 +469,7 @@ export const updateMasterProgress = async (
 };
 
 export const fetchProgressFromIndividualSheet = async (sheetId: string, accessToken: string): Promise<UnitProgress[]> => {
-  const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Progress!A2:G500`, { headers: { Authorization: `Bearer ${accessToken}` } });
+  const res = await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Progress!A2:G500`, {}, accessToken);
   const data = await res.json();
   return (data.values || []).map((row: any[]) => ({ 
     fullId: row[0] || "",
@@ -474,9 +501,7 @@ export const generateProgressFromSurvey = async (sheetId: string, detailedAnswer
       } else {
         const surveyAns = detailedAnswers.find(a => a.questionId === q.triggerId);
         if (surveyAns && surveyAns.selection) {
-          // targetOption을 콤마로 구분하여 배열로 만들고 트림 처리
           const targetList = q.targetOption.split(',').map(opt => opt.trim()).filter(opt => opt !== "");
-          // 사용자가 선택한 항목 중 하나라도 targetList에 포함되어 있는지 확인
           isMatch = surveyAns.selection.some((s: string) => targetList.includes(s.trim()));
         }
       }
@@ -495,18 +520,18 @@ export const generateProgressFromSurvey = async (sheetId: string, detailedAnswer
       }
     });
 
-    await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Progress!A2:G500?valueInputOption=USER_ENTERED`, {
+    await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Progress!A2:G500?valueInputOption=USER_ENTERED`, {
       method: 'PUT',
-      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ values: new Array(499).fill(new Array(7).fill("")) })
-    });
+    }, accessToken);
 
     if (curriculumRows.length > 0) {
-      const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Progress!A2:G${curriculumRows.length + 1}?valueInputOption=USER_ENTERED`, {
+      const res = await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Progress!A2:G${curriculumRows.length + 1}?valueInputOption=USER_ENTERED`, {
         method: 'PUT',
-        headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ values: curriculumRows })
-      });
+      }, accessToken);
       return res.ok;
     }
     return true;
@@ -521,11 +546,11 @@ export const saveSurveyAndGenerateProgress = async (sheetId: string, detailedAns
 
 export const saveSurveyData = async (sheetId: string, detailedAnswers: any[], accessToken: string): Promise<boolean> => {
   try {
-    await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Survey!A2:H100?valueInputOption=USER_ENTERED`, {
+    await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Survey!A2:H100?valueInputOption=USER_ENTERED`, {
       method: 'PUT',
-      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ values: new Array(100).fill(new Array(8).fill("")) })
-    });
+    }, accessToken);
 
     const timestamp = new Date().toLocaleString();
     const rows = detailedAnswers.map(ans => [
@@ -539,20 +564,18 @@ export const saveSurveyData = async (sheetId: string, detailedAnswers: any[], ac
       ans.memo || ""
     ]);
 
-    const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Survey!A2:H${rows.length + 1}?valueInputOption=USER_ENTERED`, {
+    const res = await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Survey!A2:H${rows.length + 1}?valueInputOption=USER_ENTERED`, {
       method: 'PUT',
-      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ values: rows })
-    });
+    }, accessToken);
     return res.ok;
   } catch (error) { return false; }
 };
 
 export const fetchSurveyFromIndividualSheet = async (sheetId: string, accessToken: string): Promise<SurveyData | undefined> => {
   try {
-    const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Survey!A2:H100`, { 
-      headers: { Authorization: `Bearer ${accessToken}` } 
-    });
+    const res = await authenticatedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Survey!A2:H100`, {}, accessToken);
     const data = await res.json();
     const rows = data.values || [];
     if (rows.length === 0) return undefined;

@@ -16,54 +16,65 @@ const App: React.FC = () => {
   const [isInitialLoading, setIsInitialLoading] = useState(true);
   
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const tokenClientRef = useRef<any>(null);
 
-  // 사일런트 리프레시: 사용자 상호작용 없이 백그라운드에서 토큰만 갱신
+  // 사일런트 리프레시 로직
   const refreshAccessTokenSilently = useCallback(() => {
-    if (!window.google || !googleAuth) return;
+    if (!window.google) return;
 
-    console.log("App: Background session maintenance starting...");
+    console.log("App: Refreshing token...");
     
-    try {
-      const client = window.google.accounts.oauth2.initTokenClient({
+    if (!tokenClientRef.current) {
+      tokenClientRef.current = window.google.accounts.oauth2.initTokenClient({
         client_id: GOOGLE_CLIENT_ID,
         scope: 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/userinfo.email',
-        prompt: 'none', // 팝업 창을 띄우지 않음
+        prompt: 'none',
         callback: (response: any) => {
           if (response.error) {
-            console.warn("App: Silent refresh skipped (will retry on next activity):", response.error);
-            // 중요: 갱신 실패 시에도 사용자를 쫓아내지 않고 현재 세션을 유지함
+            console.warn("App: Silent refresh skipped:", response.error);
             return;
           }
           
           const expiresInSeconds = parseInt(response.expires_in) || 3600;
           const newExpiresAt = Date.now() + (expiresInSeconds * 1000);
+          const newToken = response.access_token;
           
-          console.log("App: Session extended silently in background.");
+          console.log("App: Session extended silently.");
           
-          const updatedAuth = { ...googleAuth, token: response.access_token, expiresAt: newExpiresAt };
-          setGoogleAuth(updatedAuth);
+          setGoogleAuth(prev => {
+            if (!prev) return null;
+            const updated = { ...prev, token: newToken, expiresAt: newExpiresAt };
+            localStorage.setItem(SESSION_KEY, JSON.stringify(updated));
+            return updated;
+          });
           
-          // 대시보드에서 사용 중인 user 객체의 토큰도 업데이트 (화면 전환 없음)
-          if (user) {
-            setUser(prev => prev ? { ...prev, accessToken: response.access_token } : null);
-          }
+          setUser(prev => prev ? { ...prev, accessToken: newToken } : null);
 
-          localStorage.setItem(SESSION_KEY, JSON.stringify(updatedAuth));
+          // API 레이어에 갱신 완료 알림 발송
+          window.dispatchEvent(new CustomEvent('TOKEN_REFRESHED_SUCCESS', { detail: { token: newToken } }));
         }
       });
-      client.requestAccessToken();
-    } catch (e) {
-      console.error("App: Background maintenance error", e);
     }
-  }, [googleAuth, user]);
 
-  // 토큰 수명 모니터링 및 자동 갱신 스케줄링
+    tokenClientRef.current.requestAccessToken();
+  }, []);
+
+  // API 레이어에서 401 감지 시 호출되는 리스너
+  useEffect(() => {
+    const handleRefreshRequest = () => {
+      console.log("App: Refresh requested by API layer.");
+      refreshAccessTokenSilently();
+    };
+    window.addEventListener('NEED_TOKEN_REFRESH', handleRefreshRequest);
+    return () => window.removeEventListener('NEED_TOKEN_REFRESH', handleRefreshRequest);
+  }, [refreshAccessTokenSilently]);
+
+  // 토큰 수명 모니터링
   useEffect(() => {
     if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
 
     if (googleAuth) {
       const timeUntilExpiry = googleAuth.expiresAt - Date.now();
-      // 만료 10분 전부터 갱신 시도
       const refreshBuffer = 10 * 60 * 1000; 
       const delay = Math.max(timeUntilExpiry - refreshBuffer, 0);
 
@@ -81,6 +92,7 @@ const App: React.FC = () => {
     setIsSyncing(true);
     
     try {
+      // 신규 유저인지 체크할 때 만료 토큰이면 authenticatedFetch가 자동으로 refreshAccessTokenSilently를 트리거함
       const context = await syncUserWithMasterSheet(googleUser, accessToken, true);
       
       const authData = { 
@@ -99,23 +111,20 @@ const App: React.FC = () => {
         setUser({ ...googleUser, accessToken, context });
       }
     } catch (error) {
-      console.error("App: Session restoration failed", error);
-      // 복구 실패 시에만 로컬 스토리지 비움
-      localStorage.removeItem(SESSION_KEY);
-      setGoogleAuth(null);
+      console.error("App: Sync error during session restoration", error);
+      // 단순 에러면 로그인 페이지로 쫓아내지 않고 유지 (재시도 등)
     } finally {
       setIsSyncing(false);
       setIsInitialLoading(false);
     }
   }, []);
 
-  // 앱 시작 시 기존 세션 복구
+  // 세션 복구
   useEffect(() => {
     const savedSession = localStorage.getItem(SESSION_KEY);
     if (savedSession) {
       try {
         const { user: savedUser, token: savedToken, expiresAt } = JSON.parse(savedSession);
-        // 토큰이 유효하면 즉시 복구, 만료되었더라도 일단 복구 후 사일런트 리프레시가 처리하게 함
         if (savedUser && savedToken) {
           handleLoginSuccess(savedUser, savedToken, expiresAt, false);
         } else {
@@ -142,7 +151,7 @@ const App: React.FC = () => {
       setGoogleAuth(updatedAuth);
       setUser({ ...updatedGoogleUser, accessToken: googleAuth.token, context });
     } catch (error) {
-      alert("사용자 정보를 등록하는 중 오류가 발생했습니다.");
+      alert("등록 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.");
     } finally {
       setIsSyncing(false);
     }
@@ -166,23 +175,20 @@ const App: React.FC = () => {
           OPIc<span className="text-blue-600">FLOW</span>
         </h2>
         <p className="text-slate-400 text-[11px] font-black uppercase tracking-widest">
-          {isInitialLoading ? "Restoring Session" : "Syncing Data"}
+          {isInitialLoading ? "Verifying Session" : "Syncing Data"}
         </p>
       </div>
     );
   }
 
-  // 사용자가 명확히 로그아웃 상태일 때만 로그인 페이지를 보여줌
   if (!user && !googleAuth) {
     return <Login onLoginSuccess={handleLoginSuccess} />;
   }
 
-  // 구글 인증은 되었으나 추가 정보 입력이 필요한 경우
   if (!user && googleAuth) {
     return <NameEntry googleUser={googleAuth.user} onConfirm={handleNameConfirm} />;
   }
 
-  // 메인 대시보드: 여기서 일어나는 모든 세션 연장은 백그라운드에서 사일런트하게 진행됨
   return <Dashboard user={user!} onLogout={handleLogout} />;
 };
 
