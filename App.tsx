@@ -22,27 +22,47 @@ const App: React.FC = () => {
   
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const tokenClientRef = useRef<any>(null);
+  const isRefreshingToken = useRef(false);
 
   // 구글 토큰 갱신 메인 로직
   const refreshAccessTokenSilently = useCallback((isManualTrigger = false) => {
     if (!window.google || !window.google.accounts) return;
 
+    // 가드 1: 이미 토큰 갱신이 진행 중인 경우 (수동 트리거 제외)
+    if (isRefreshingToken.current && !isManualTrigger) {
+      console.log("App: Token refresh already in progress. Skipping.");
+      return;
+    }
+
     const isMobile = isMobileDevice();
+
+    // 가드 2: 수동 트리거가 아니고 토큰 만료 시간이 15분 이상 남은 경우 실행 방지
+    if (!isManualTrigger && googleAuth) {
+      const timeUntilExpiry = googleAuth.expiresAt - Date.now();
+      const minBuffer = 15 * 60 * 1000; // 15분
+      if (timeUntilExpiry > minBuffer) {
+        console.log(`App: Token is still valid for ${Math.round(timeUntilExpiry / 60000)}m. Skipping auto-refresh.`);
+        return;
+      }
+    }
+
     console.log(`App: Refreshing token (isMobile: ${isMobile}, manual: ${isManualTrigger})`);
+    isRefreshingToken.current = true;
     
-    // 토큰 클라이언트 초기화
+    // 토큰 클라이언트 초기화 및 콜백 설정
     if (!tokenClientRef.current) {
       tokenClientRef.current = window.google.accounts.oauth2.initTokenClient({
         client_id: GOOGLE_CLIENT_ID,
         scope: 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/userinfo.email',
         prompt: 'none',
         callback: (response: any) => {
+          isRefreshingToken.current = false;
+
           if (response.error) {
             console.warn("App: Token refresh error:", response.error);
             
-            // 모바일 환경에서 silent refresh 실패 시
-            if (isMobile && (response.error === 'immediate_failed' || response.error === 'interaction_required')) {
-              // 초기 로딩 중이라면 경고창 없이 세션을 날리고 로그인으로 유도
+            // 모바일 환경 에러 핸들링
+            if (isMobile) {
               if (isInitialLoading) {
                 console.log("App: Mobile silent refresh failed during initial load. Clearing session.");
                 localStorage.removeItem(SESSION_KEY);
@@ -52,14 +72,17 @@ const App: React.FC = () => {
                 return;
               }
 
-              // 사용 중인 상태라면 사용자에게 알림
-              if (!isManualTrigger) {
+              // 보안 정책으로 인한 에러 시 사용자 확인 후 팝업 유도
+              if (!isManualTrigger && (response.error === 'immediate_failed' || response.error === 'interaction_required')) {
                 alert("보안 정책으로 인해 세션 연장이 필요합니다. 확인을 누르시면 로그인 창이 표시됩니다.");
                 tokenClientRef.current.requestAccessToken({ prompt: '' });
               }
               return;
+            } else {
+              // PC 환경: 에러 발생 시 로그만 기록하고 사용자 경험 보호 (자동 팝업 금지)
+              console.log("App: Silent refresh failed on PC. No automatic prompt triggered.");
+              return;
             }
-            return;
           }
           
           const expiresInSeconds = parseInt(response.expires_in) || 3600;
@@ -81,8 +104,10 @@ const App: React.FC = () => {
       });
     }
 
-    tokenClientRef.current.requestAccessToken({ prompt: isManualTrigger ? '' : 'none' });
-  }, [isInitialLoading]);
+    // [중요] prompt 설정 분기: 수동 트리거일 때만 ''(빈값), 평소엔 'none' 유지
+    const promptValue = isManualTrigger ? '' : 'none';
+    tokenClientRef.current.requestAccessToken({ prompt: promptValue });
+  }, [googleAuth, isInitialLoading]);
 
   // API 레이어에서 401 감지 시 호출되는 리스너
   useEffect(() => {
