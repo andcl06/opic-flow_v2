@@ -9,6 +9,11 @@ import { GOOGLE_CLIENT_ID } from './constants';
 
 const SESSION_KEY = 'OPICFLOW_AUTH_SESSION_V2';
 
+// 모바일 환경 감지 유틸리티
+const isMobileDevice = () => {
+  return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+};
+
 const App: React.FC = () => {
   const [googleAuth, setGoogleAuth] = useState<{ user: GoogleUser, token: string, expiresAt: number } | null>(null);
   const [user, setUser] = useState<FullUser | null>(null);
@@ -18,12 +23,14 @@ const App: React.FC = () => {
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const tokenClientRef = useRef<any>(null);
 
-  // 사일런트 리프레시 로직
-  const refreshAccessTokenSilently = useCallback(() => {
-    if (!window.google) return;
+  // 구글 토큰 갱신 메인 로직
+  const refreshAccessTokenSilently = useCallback((isManualTrigger = false) => {
+    if (!window.google || !window.google.accounts) return;
 
-    console.log("App: Refreshing token...");
+    const isMobile = isMobileDevice();
+    console.log(`App: Refreshing token (isMobile: ${isMobile}, manual: ${isManualTrigger})`);
     
+    // 토큰 클라이언트 초기화
     if (!tokenClientRef.current) {
       tokenClientRef.current = window.google.accounts.oauth2.initTokenClient({
         client_id: GOOGLE_CLIENT_ID,
@@ -31,7 +38,27 @@ const App: React.FC = () => {
         prompt: 'none',
         callback: (response: any) => {
           if (response.error) {
-            console.warn("App: Silent refresh skipped:", response.error);
+            console.warn("App: Token refresh error:", response.error);
+            
+            // 모바일 환경에서 silent refresh 실패 시
+            if (isMobile && (response.error === 'immediate_failed' || response.error === 'interaction_required')) {
+              // 초기 로딩 중이라면 경고창 없이 세션을 날리고 로그인으로 유도
+              if (isInitialLoading) {
+                console.log("App: Mobile silent refresh failed during initial load. Clearing session.");
+                localStorage.removeItem(SESSION_KEY);
+                setGoogleAuth(null);
+                setUser(null);
+                setIsInitialLoading(false);
+                return;
+              }
+
+              // 사용 중인 상태라면 사용자에게 알림
+              if (!isManualTrigger) {
+                alert("보안 정책으로 인해 세션 연장이 필요합니다. 확인을 누르시면 로그인 창이 표시됩니다.");
+                tokenClientRef.current.requestAccessToken({ prompt: '' });
+              }
+              return;
+            }
             return;
           }
           
@@ -39,7 +66,7 @@ const App: React.FC = () => {
           const newExpiresAt = Date.now() + (expiresInSeconds * 1000);
           const newToken = response.access_token;
           
-          console.log("App: Session extended silently.");
+          console.log("App: Session extended successfully.");
           
           setGoogleAuth(prev => {
             if (!prev) return null;
@@ -49,15 +76,13 @@ const App: React.FC = () => {
           });
           
           setUser(prev => prev ? { ...prev, accessToken: newToken } : null);
-
-          // API 레이어에 갱신 완료 알림 발송
           window.dispatchEvent(new CustomEvent('TOKEN_REFRESHED_SUCCESS', { detail: { token: newToken } }));
         }
       });
     }
 
-    tokenClientRef.current.requestAccessToken();
-  }, []);
+    tokenClientRef.current.requestAccessToken({ prompt: isManualTrigger ? '' : 'none' });
+  }, [isInitialLoading]);
 
   // API 레이어에서 401 감지 시 호출되는 리스너
   useEffect(() => {
@@ -69,7 +94,25 @@ const App: React.FC = () => {
     return () => window.removeEventListener('NEED_TOKEN_REFRESH', handleRefreshRequest);
   }, [refreshAccessTokenSilently]);
 
-  // 토큰 수명 모니터링
+  // 브라우저 탭 활성화 시 토큰 체크 (모바일 백그라운드 복귀 대응)
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible' && googleAuth) {
+        const timeUntilExpiry = googleAuth.expiresAt - Date.now();
+        const refreshBuffer = 10 * 60 * 1000; 
+        
+        if (timeUntilExpiry < refreshBuffer) {
+          console.log("App: Tab visible and token near expiry. Refreshing...");
+          refreshAccessTokenSilently();
+        }
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, [googleAuth, refreshAccessTokenSilently]);
+
+  // 토큰 수명 타이머 기반 모니터링
   useEffect(() => {
     if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
 
@@ -92,14 +135,8 @@ const App: React.FC = () => {
     setIsSyncing(true);
     
     try {
-      // 신규 유저인지 체크할 때 만료 토큰이면 authenticatedFetch가 자동으로 refreshAccessTokenSilently를 트리거함
       const context = await syncUserWithMasterSheet(googleUser, accessToken, true);
-      
-      const authData = { 
-        user: googleUser, 
-        token: accessToken,
-        expiresAt: expiresAt 
-      };
+      const authData = { user: googleUser, token: accessToken, expiresAt: expiresAt };
 
       if (persist) {
         localStorage.setItem(SESSION_KEY, JSON.stringify(authData));
@@ -112,20 +149,38 @@ const App: React.FC = () => {
       }
     } catch (error) {
       console.error("App: Sync error during session restoration", error);
-      // 단순 에러면 로그인 페이지로 쫓아내지 않고 유지 (재시도 등)
+      // 복구 실패 시 세션 정보 삭제 (모바일 환경에서의 무한 로딩 방지)
+      if (isMobileDevice()) {
+        localStorage.removeItem(SESSION_KEY);
+        setGoogleAuth(null);
+        setUser(null);
+      }
     } finally {
       setIsSyncing(false);
       setIsInitialLoading(false);
     }
   }, []);
 
-  // 세션 복구
+  // 세션 복구 로직
   useEffect(() => {
     const savedSession = localStorage.getItem(SESSION_KEY);
     if (savedSession) {
       try {
         const { user: savedUser, token: savedToken, expiresAt } = JSON.parse(savedSession);
+        
         if (savedUser && savedToken) {
+          const isMobile = isMobileDevice();
+          const timeUntilExpiry = expiresAt - Date.now();
+          const refreshBuffer = 5 * 60 * 1000; // 5분 여유
+
+          // 모바일에서 토큰이 이미 만료되었거나 5분 이내라면 silent refresh 시도하지 말고 로그인 유도
+          if (isMobile && timeUntilExpiry < refreshBuffer) {
+            console.log("App: Mobile token expired or near expiry. Forcing re-login.");
+            localStorage.removeItem(SESSION_KEY);
+            setIsInitialLoading(false);
+            return;
+          }
+
           handleLoginSuccess(savedUser, savedToken, expiresAt, false);
         } else {
           setIsInitialLoading(false);
