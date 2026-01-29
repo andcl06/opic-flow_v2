@@ -28,6 +28,7 @@ import { GoogleGenAI, Modality } from "@google/genai";
 const PART_DELIMITER = " [PART] ";
 
 type AnswerDirection = 'EASY' | 'NATIVE' | 'STORYTELLER' | null;
+type GenerationMode = 'AI' | 'MANUAL';
 
 function decodeBase64(base64: string) {
   const binaryString = atob(base64);
@@ -88,6 +89,11 @@ const Dashboard: React.FC<DashboardProps> = ({ user: initialUser, onLogout }) =>
   const [currentQuestion, setCurrentQuestion] = useState<OPIcQuestion | null>(null);
   const [userKeywords, setUserKeywords] = useState("");
   
+  // New States for Question Generation
+  const [genMode, setGenMode] = useState<GenerationMode>('AI');
+  const [aiGenKeyword, setAiGenKeyword] = useState("");
+  const [manualQuestionText, setManualQuestionText] = useState("");
+
   const [selectedDirection, setSelectedDirection] = useState<AnswerDirection>(null);
   
   const [isRecording, setIsRecording] = useState(false);
@@ -162,7 +168,7 @@ const Dashboard: React.FC<DashboardProps> = ({ user: initialUser, onLogout }) =>
           categories[categoryName].topicGroups[topicName] = { units: [], originalIndexes: [] };
         }
         categories[categoryName].topicGroups[topicName].units.push(unit);
-        categories[categoryName].topicGroups[topicName].originalIndexes.push(idx);
+        categories[categories[categoryName].topicGroups[topicName].originalIndexes.push(idx)];
       }
     });
 
@@ -327,6 +333,9 @@ const Dashboard: React.FC<DashboardProps> = ({ user: initialUser, onLogout }) =>
     setExtractedVocab([]);
     setIsRestudyMode(false);
     setIsSidebarOpen(false);
+    setAiGenKeyword("");
+    setManualQuestionText("");
+    setGenMode('AI');
     
     const logs = await fetchStudyLogs(user.context.individualSheetId!, user.accessToken);
     const filtered = logs.filter(l => {
@@ -610,7 +619,7 @@ Output as JSON: {"transcript":string,"correctionParts":{"intro":string,"body":st
         sessionId,
         date: practiceTime,
         unit: `[${currentUnit.fullId}] ${currentUnit.topic} - ${currentUnit.essence}`, 
-        type: masterQuestionDb.find(q => q.fullId === currentUnit.fullId)?.strategy || "General",
+        type: currentQuestion!.type || masterQuestionDb.find(q => q.fullId === currentUnit.fullId)?.strategy || "General",
         question: currentQuestion!.question,
         keywords: userKeywords,
         rawAnswer: result.transcript,
@@ -675,15 +684,37 @@ Output as JSON: {"transcript":string,"correctionParts":{"intro":string,"body":st
     const meta = masterQuestionDb.find(q => q.fullId === units[selectedUnitIdx!].fullId);
     try {
       const ai = getAiInstance();
+      const keywordContext = aiGenKeyword ? `Reflect this specific context or keyword in the question generation: "${aiGenKeyword}". ` : "";
       const prompt = meta 
-        ? `As an OPIc expert, generate a realistic exam question based on these: Topic: ${meta.topic}, Essence: ${meta.essence}, Strategy: ${meta.strategy}. Output JSON: {"unit":string,"type":string,"question":string,"description":string}`
-        : `Generate OPIc question for "${units[selectedUnitIdx!].topic}". JSON: {"unit":string,"type":string,"question":string,"description":string}`;
+        ? `As an OPIc expert, generate a realistic exam question based on these: Topic: ${meta.topic}, Essence: ${meta.essence}, Strategy: ${meta.strategy}. ${keywordContext} Output JSON: {"unit":string,"type":string,"question":string,"description":string}`
+        : `Generate OPIc question for "${units[selectedUnitIdx!].topic}". ${keywordContext} JSON: {"unit":string,"type":string,"question":string,"description":string}`;
       const res = await ai.models.generateContent({ model: "gemini-3-flash-preview", contents: prompt, config: { responseMimeType: "application/json" } });
       setCurrentQuestion(JSON.parse(res.text!));
       setUserKeywords("");
       setFeedbackResult(null);
       setIsUnitPreview(false);
     } catch (e) { alert("질문 생성 실패"); } finally { setIsGenerating(false); }
+  };
+
+  const startManualSession = () => {
+    if (!manualQuestionText.trim()) {
+      alert("질문을 입력해주세요.");
+      return;
+    }
+    stopAllAudio();
+    setIsRestudyMode(false);
+    setShowTranslation(false);
+    setExtractedVocab([]);
+    const currentUnit = units[selectedUnitIdx!];
+    setCurrentQuestion({
+      unit: currentUnit.topic,
+      type: "Direct Input",
+      question: manualQuestionText.trim(),
+      description: "User provided manual question"
+    });
+    setUserKeywords("");
+    setFeedbackResult(null);
+    setIsUnitPreview(false);
   };
 
   const restudyLog = (log: StudyLogEntry) => {
@@ -1255,7 +1286,61 @@ Output as JSON: {"transcript":string,"correctionParts":{"intro":string,"body":st
                         </div>
                       </div>
                     )}
-                    <button onClick={startNewSession} className="w-full px-12 py-5 text-lg font-black text-white transition-all shadow-2xl shadow-blue-200 sm:w-auto lg:px-16 lg:text-xl bg-blue-600 rounded-3xl hover:bg-blue-700 hover:-translate-y-1 active:scale-95 hidden-print">학습 시작하기</button>
+                    
+                    {/* New Generation Choice UI */}
+                    <div className="w-full max-w-xl mx-auto bg-slate-50 border border-slate-200 rounded-[32px] overflow-hidden shadow-sm mb-8 hidden-print">
+                      <div className="flex border-b border-slate-200">
+                        <button 
+                          onClick={() => setGenMode('AI')} 
+                          className={`flex-1 py-4 text-xs font-black uppercase tracking-widest transition-all ${genMode === 'AI' ? 'bg-white text-blue-600 border-b-2 border-blue-600' : 'text-slate-400 hover:text-slate-600'}`}
+                        >
+                          AI 질문 생성
+                        </button>
+                        <button 
+                          onClick={() => setGenMode('MANUAL')} 
+                          className={`flex-1 py-4 text-xs font-black uppercase tracking-widest transition-all ${genMode === 'MANUAL' ? 'bg-white text-blue-600 border-b-2 border-blue-600' : 'text-slate-400 hover:text-slate-600'}`}
+                        >
+                          직접 입력
+                        </button>
+                      </div>
+                      
+                      <div className="p-6">
+                        {genMode === 'AI' ? (
+                          <div className="space-y-4 animate-in fade-in duration-300">
+                            <div className="text-left">
+                              <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-2 block">상황/키워드 추가 (선택사항)</label>
+                              <input 
+                                type="text" 
+                                value={aiGenKeyword}
+                                onChange={(e) => setAiGenKeyword(e.target.value)}
+                                placeholder="ex) 친구와 약속, 주말 여행, 장비 고장 등" 
+                                className="w-full px-4 py-3 bg-white border border-slate-200 rounded-2xl outline-none focus:border-blue-400 transition-all font-bold text-sm"
+                              />
+                            </div>
+                            <button onClick={startNewSession} className="w-full py-4 bg-blue-600 text-white rounded-2xl font-black text-lg shadow-xl shadow-blue-100 hover:bg-blue-700 transition-all flex items-center justify-center space-x-2">
+                              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+                              <span>AI 질문 생성 시작</span>
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="space-y-4 animate-in fade-in duration-300">
+                            <div className="text-left">
+                              <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-2 block">질문 내용 입력</label>
+                              <textarea 
+                                value={manualQuestionText}
+                                onChange={(e) => setManualQuestionText(e.target.value)}
+                                placeholder="연습하고 싶은 질문을 여기에 붙여넣으세요." 
+                                className="w-full px-4 py-3 bg-white border border-slate-200 rounded-2xl outline-none focus:border-blue-400 transition-all font-bold text-sm h-24"
+                              />
+                            </div>
+                            <button onClick={startManualSession} className="w-full py-4 bg-slate-900 text-white rounded-2xl font-black text-lg shadow-xl hover:bg-blue-600 transition-all flex items-center justify-center space-x-2">
+                              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 00-2 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
+                              <span>이 질문으로 학습 시작</span>
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    </div>
                   </div>
                   {unitHistory.length > 0 && (
                     <div className="pt-8 pb-6 mt-10 border-t hidden-print">

@@ -33,9 +33,43 @@ const Survey: React.FC<SurveyProps> = ({ initialData, onComplete, onCancel, acce
 
   useEffect(() => {
     fetchSurveyDatabase(accessToken)
-      .then(setDb)
+      .then((fetchedDb) => {
+        setDb(fetchedDb);
+        
+        // 기존 데이터(initialData)가 있는 경우 사전 체크 로직 수행
+        if (initialData && fetchedDb.length > 0) {
+          const preLog = new Map<string, SurveyQuestion[]>();
+          
+          fetchedDb.forEach(item => {
+            const qId = item.id;
+            const opt = item.option.trim();
+            let isMatch = false;
+
+            // SurveyData의 필드들에서 콤마로 구분된 값을 분리하여 비교
+            if (qId.startsWith('Q1')) {
+              const jobValues = initialData.job.split(', ').map(v => v.trim());
+              isMatch = jobValues.includes(opt);
+            } else if (qId.startsWith('Q2')) {
+              const studentValues = initialData.studentStatus.split(', ').map(v => v.trim());
+              isMatch = studentValues.includes(opt);
+            } else if (qId === 'Q3') {
+              const residenceValues = initialData.residence.split(', ').map(v => v.trim());
+              isMatch = residenceValues.includes(opt);
+            } else if (['Q4', 'Q5', 'Q6', 'Q7'].includes(qId)) {
+              isMatch = initialData.activities.includes(opt);
+            }
+
+            if (isMatch) {
+              const existing = preLog.get(qId) || [];
+              preLog.set(qId, [...existing, item]);
+            }
+          });
+          
+          setAnswerLog(preLog);
+        }
+      })
       .finally(() => setIsLoading(false));
-  }, [accessToken]);
+  }, [accessToken, initialData]);
 
   const currentOptions = useMemo(() => db.filter(q => q.id === currentId), [db, currentId]);
   const currentQuestionText = currentOptions[0]?.question || "";
